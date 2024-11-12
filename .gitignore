@@ -1,2 +1,3 @@
 sessions/session01_basicTorch/ch00_Quickstart/data/*
 sessions/session01_basicTorch/ch02_DatasetsAndDataLoaders/data/*
+sessions/session01_basicTorch/ch03_Transforms/data/*
