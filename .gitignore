@@ -4,3 +4,4 @@ sessions/session01_basicTorch/ch03_Transforms/data/*
 sessions/session01_basicTorch/ch06_OptimizationLoop/data/*
 sessions/session01_basicTorch/ch07_Save-Load-UseModel/*.pth
 data/*
+sessions/session02_deeplearning/best_model.pth
