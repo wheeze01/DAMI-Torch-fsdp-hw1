@@ -1,9 +1,16 @@
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
 from torch.nn.parallel import DataParallel
 import torch.nn as nn
+
+
+# Hugging Face 모델 다운로드를 위한 HF_HOME 설정
+HF_HOME = os.getenv("HF_HOME", "./hf_models")  # 기본값은 ./hf_models
+os.environ["HF_HOME"] = HF_HOME  # 환경 변수 설정
+os.makedirs(HF_HOME, exist_ok=True)  # 경로가 없으면 생성
 
 
 # DummyDataset: 시드 고정
@@ -29,7 +36,9 @@ class DummyDataset(Dataset):
 
 # 메모리 확인 및 최대 배치 크기 탐색
 def find_max_batch_size(device, start_batch_size=1, max_batch_size=1024, step=1):
-    model = T5ForConditionalGeneration.from_pretrained("t5-large")
+    model = T5ForConditionalGeneration.from_pretrained(
+        "t5-large", cache_dir=HF_HOME  # HF_HOME을 캐시 경로로 사용
+    )
     model.to(device)
     model = DataParallel(model)  # DP 설정
     dataset = DummyDataset(num_samples=1000)  # 샘플 데이터 수 줄이기
@@ -72,7 +81,9 @@ def find_max_batch_size(device, start_batch_size=1, max_batch_size=1024, step=1)
 
 # 학습 함수
 def train(device, batch_size, epochs=1):
-    model = T5ForConditionalGeneration.from_pretrained("t5-large")
+    model = T5ForConditionalGeneration.from_pretrained(
+        "t5-large", cache_dir=HF_HOME  # HF_HOME을 캐시 경로로 사용
+    )
     model.to(device)
     model = DataParallel(model)  # DP 설정
 
