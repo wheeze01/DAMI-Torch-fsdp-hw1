@@ -2,17 +2,15 @@ import os
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
-
 import functools
-
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.t5.modeling_t5 import T5Block
+
 
 # Hugging Face 캐시 경로 설정
 HF_HOME = os.getenv("HF_HOME", "./hf_models")
@@ -41,6 +39,14 @@ class DummyDataset(Dataset):
         }
 
 
+# 모델 초기화 함수
+def initialize_model(rank):
+    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME)
+    wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={T5Block})
+    model = FSDP(model, auto_wrap_policy=wrap_policy, device_id=rank)
+    return model
+
+
 # 최대 배치 크기 찾기
 def find_max_batch_size(rank, world_size, start_batch_size=1, max_batch_size=1024, step=16):
     dist.init_process_group(
@@ -51,8 +57,7 @@ def find_max_batch_size(rank, world_size, start_batch_size=1, max_batch_size=102
     )
     torch.cuda.set_device(rank)
 
-    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME).to(rank)
-    model = DDP(model, device_ids=[rank])
+    model = initialize_model(rank)
 
     dataset = DummyDataset(num_samples=1000)
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
@@ -67,13 +72,15 @@ def find_max_batch_size(rank, world_size, start_batch_size=1, max_batch_size=102
                 data = {k: data[k].to(rank) for k in data}
                 output = model(**data)
                 torch.mean(output.loss).backward()
-                break  # 한 번의 배치만 테스트
-            print(f"Rank {rank}: Batch size {batch_size} succeeded.")
+                break
+            if rank == 0:
+                print(f"Batch size {batch_size} succeeded.")
             success_batch_size = batch_size
             batch_size += step
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
-                print(f"Rank {rank}: Batch size {batch_size} failed due to OOM.")
+                if rank == 0:
+                    print(f"Batch size {batch_size} failed due to OOM.")
                 break
             else:
                 raise e
@@ -82,18 +89,17 @@ def find_max_batch_size(rank, world_size, start_batch_size=1, max_batch_size=102
     return success_batch_size
 
 
+# 학습 함수
 def train(rank, world_size, batch_size, epochs=100):
-    global_rank = rank
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:33445",
-        rank=global_rank,
+        rank=rank,
         world_size=world_size,
     )
     torch.cuda.set_device(rank)
-    model = T5ForConditionalGeneration.from_pretrained("t5-large")
-    wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={T5Block})
-    model = FSDP(model, auto_wrap_policy=wrap_policy, device_id=rank)
+
+    model = initialize_model(rank)
 
     dataset = DummyDataset()
     sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
@@ -101,26 +107,27 @@ def train(rank, world_size, batch_size, epochs=100):
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc=f"Epoch Progress (Rank {rank})", position=rank):
         sampler.set_epoch(epoch)
-        for data in tqdm(dataloader):
+        batch_bar = tqdm(dataloader, desc=f"Batch Progress (Rank {rank})", leave=False, position=rank + 1)
+        for data in batch_bar:
             data = {k: data[k].to(rank) for k in data}
-
             optimizer.zero_grad()
-
             output = model(**data)
-            output.loss.backward()
+            loss = torch.mean(output.loss)
+            loss.backward()
             optimizer.step()
+            batch_bar.set_postfix(loss=loss.item())
+
+    dist.destroy_process_group()
 
 
 # 메인 실행 함수
 def main(rank, world_size, start_batch_size, max_batch_size, step, epochs):
-    # 최대 배치 크기 탐색
     if rank == 0:
         print("Finding maximum batch size...")
     max_batch_size = find_max_batch_size(rank, world_size, start_batch_size, max_batch_size, step)
 
-    # 학습 시작
     if rank == 0:
         print(f"Starting training with batch size {max_batch_size}...")
     train(rank, world_size, batch_size=max_batch_size, epochs=epochs)
