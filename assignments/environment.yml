@@ -1,5 +1,3 @@
-# environment.yml
-
 name: t5_translation
 channels:
   - defaults
@@ -15,3 +13,4 @@ dependencies:
     - PyYAML>=6.0
     - tqdm>=4.0.0
     - numpy>=1.21.0
+    - sentencepiece>=0.1.96
