@@ -1,0 +1,14 @@
+# src/config/config.yaml
+
+data_dir: "../data"
+model_name: "t5-small"
+batch_size: 16
+num_epochs: 3
+learning_rate: 5e-5
+max_source_length: 128
+max_target_length: 128
+parallelism: "dp"  # "dp", "ddp", "fsdp", or "none"
+
+# 평가 설정
+model_checkpoint: "../model/checkpoints/epoch_3.pth"
+metric: "bleu"
