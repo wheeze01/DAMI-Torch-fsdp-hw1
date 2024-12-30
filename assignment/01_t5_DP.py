@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
 from torch.nn.parallel import DataParallel
+from torch.cuda.amp import GradScaler
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -40,7 +41,7 @@ def find_max_batch_size(device, start_batch_size=2, max_batch_size=1024):
     )
     model.to(device)
     model = DataParallel(model)
-    dataset = DummyDataset(num_samples=1000)
+    dataset = DummyDataset(num_samples=100)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     batch_size = start_batch_size
@@ -92,9 +93,8 @@ def train(device, batch_size, epochs=1):
     dataset = DummyDataset()
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    scaler = torch.amp.GradScaler()
+    scaler = GradScaler()
 
-    total_tokens = 0
     start_time = torch.cuda.Event(enable_timing=True)
     end_time = torch.cuda.Event(enable_timing=True)
 
@@ -116,7 +116,6 @@ def train(device, batch_size, epochs=1):
 
             # 처리된 토큰 계산
             batch_tokens = batch_size * data["input_ids"].size(1)
-            total_tokens += batch_tokens
             elapsed_time = start_time.elapsed_time(end_time) / 1000.0  # 초 단위로 변환
             tokens_per_second = batch_tokens / elapsed_time if elapsed_time > 0 else 0
 
@@ -124,7 +123,6 @@ def train(device, batch_size, epochs=1):
             batch_bar.set_postfix(
                 loss=loss.item(),
                 tokens_per_second=f"{tokens_per_second:.2f}",
-                total_tokens=total_tokens
             )
 
 # GPU 설정 및 최대 배치 크기 탐색 실행
@@ -134,4 +132,4 @@ if __name__ == "__main__":
     max_batch_size = find_max_batch_size(device=device, start_batch_size=2, max_batch_size=1024)
 
     print(f"Starting training with batch size {max_batch_size}...")
-    train(device=device, batch_size=max_batch_size, epochs=5)
+    train(device=device, batch_size=max_batch_size, epochs=2)

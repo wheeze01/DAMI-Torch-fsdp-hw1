@@ -1,26 +1,23 @@
 import os
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
-import functools
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.t5.modeling_t5 import T5Block
+from torch.cuda.amp import GradScaler
+import torch.distributed as dist
 
+import warnings
+warnings.filterwarnings("ignore")
 
-# Hugging Face 캐시 경로 설정
 HF_HOME = os.getenv("HF_HOME", "./hf_models")
 os.environ["HF_HOME"] = HF_HOME
 os.makedirs(HF_HOME, exist_ok=True)
 
 
-# DummyDataset 정의
 class DummyDataset(Dataset):
-    def __init__(self, num_samples=64000, num_tokens=256, max_len=256, seed=42):
+    def __init__(self, num_samples=640, num_tokens=256, max_len=256, seed=42):
         super().__init__()
         torch.manual_seed(seed)
         self.num_samples = num_samples
@@ -39,106 +36,115 @@ class DummyDataset(Dataset):
         }
 
 
-# 모델 초기화 함수
-def initialize_model(rank):
-    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME)
-    wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={T5Block})
-    model = FSDP(model, auto_wrap_policy=wrap_policy, device_id=rank)
-    return model
-
-
-# 최대 배치 크기 찾기
-def find_max_batch_size(rank, world_size, start_batch_size=1, max_batch_size=1024, step=16):
-    dist.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:33445",
-        rank=rank,
-        world_size=world_size,
-    )
-    torch.cuda.set_device(rank)
-
-    model = initialize_model(rank)
-
-    dataset = DummyDataset(num_samples=1000)
-    sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
+def find_max_batch_size(local_rank, model, dataset, device, start_batch_size=2, max_batch_size=1024):
     batch_size = start_batch_size
     success_batch_size = batch_size
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    scaler = GradScaler()
+
+    pbar = tqdm(total=max_batch_size, desc=f"GPU {local_rank}: Finding Max Batch Size", position=local_rank)
 
     while batch_size <= max_batch_size:
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        sampler = DistributedSampler(dataset, shuffle=False)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
+
         try:
             torch.cuda.empty_cache()
             for data in dataloader:
-                data = {k: data[k].to(rank) for k in data}
-                output = model(**data)
-                torch.mean(output.loss).backward()
+                data = {k: v.to(device) for k, v in data.items()}
+                optimizer.zero_grad()
+                with torch.cuda.amp.autocast():
+                    output = model(**data)
+                    loss = torch.mean(output.loss)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 break
-            if rank == 0:
-                print(f"Batch size {batch_size} succeeded.")
+
             success_batch_size = batch_size
-            batch_size += step
+            batch_size *= 2
+            pbar.set_postfix(success_batch_size=success_batch_size)
+
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
-                if rank == 0:
-                    print(f"Batch size {batch_size} failed due to OOM.")
+                print(f"GPU {local_rank}: Batch size {batch_size} failed due to OOM.")
+                batch_size //= 2
                 break
             else:
                 raise e
 
-    dist.destroy_process_group()
+    pbar.close()
     return success_batch_size
 
 
-# 학습 함수
-def train(rank, world_size, batch_size, epochs=100):
-    dist.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:33445",
-        rank=rank,
-        world_size=world_size,
-    )
-    torch.cuda.set_device(rank)
-
-    model = initialize_model(rank)
+def train_fsdp(local_rank, world_size, epochs=2):
+    dist.init_process_group(backend="nccl", init_method="env://", rank=local_rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
 
     dataset = DummyDataset()
-    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank)
+    dataloader = DataLoader(dataset, sampler=sampler, drop_last=True)
+
+    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME).to(device)
+    model = FSDP(model)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    scaler = GradScaler()
 
-    for epoch in tqdm(range(epochs), desc=f"Epoch Progress (Rank {rank})", position=rank):
+    max_batch_size = find_max_batch_size(local_rank, model, dataset, device)
+    print(f"GPU {local_rank}: Using batch size {max_batch_size}")
+
+    for epoch in range(epochs):
         sampler.set_epoch(epoch)
-        batch_bar = tqdm(dataloader, desc=f"Batch Progress (Rank {rank})", leave=False, position=rank + 1)
+        dataloader = DataLoader(dataset, batch_size=max_batch_size, sampler=sampler, drop_last=True)
+
+        batch_bar = tqdm(dataloader, desc=f"GPU {local_rank} Epoch {epoch + 1}/{epochs}", position=local_rank)
         for data in batch_bar:
-            data = {k: data[k].to(rank) for k in data}
+            data = {k: v.to(device) for k, v in data.items()}
+
             optimizer.zero_grad()
-            output = model(**data)
-            loss = torch.mean(output.loss)
-            loss.backward()
-            optimizer.step()
-            batch_bar.set_postfix(loss=loss.item())
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            start_time.record()
+
+            try:
+                with torch.cuda.amp.autocast():
+                    output = model(
+                        input_ids=data["input_ids"],
+                        decoder_input_ids=data["decoder_input_ids"],
+                        labels=data["labels"],  # Ensure labels are passed for loss calculation
+                        return_dict=True,  # Ensure output is a dictionary
+                    )
+                    loss = output.loss
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                end_time.record()
+                torch.cuda.synchronize()
+
+                batch_tokens = max_batch_size * data["input_ids"].size(1)
+                elapsed_time = start_time.elapsed_time(end_time) / 1000.0
+                tokens_per_second = batch_tokens / elapsed_time if elapsed_time > 0 else 0
+
+                batch_bar.set_postfix(
+                    loss=loss.item(),
+                    tokens_per_second=f"{tokens_per_second:.2f}",
+                )
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    print(f"GPU {local_rank}: OOM occurred during training.")
+                    max_batch_size //= 2
+                    break
+                else:
+                    raise e
 
     dist.destroy_process_group()
-
-
-# 메인 실행 함수
-def main(rank, world_size, start_batch_size, max_batch_size, step, epochs):
-    if rank == 0:
-        print("Finding maximum batch size...")
-    max_batch_size = find_max_batch_size(rank, world_size, start_batch_size, max_batch_size, step)
-
-    if rank == 0:
-        print(f"Starting training with batch size {max_batch_size}...")
-    train(rank, world_size, batch_size=max_batch_size, epochs=epochs)
-
-
+    
 if __name__ == "__main__":
-    num_gpus = 2
-    world_size = num_gpus
-    start_batch_size = 2
-    max_batch_size = 512
-    step = 32
-    epochs = 5
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
 
-    mp.spawn(main, nprocs=num_gpus, args=(world_size, start_batch_size, max_batch_size, step, epochs))
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(train_fsdp, args=(world_size,), nprocs=world_size)

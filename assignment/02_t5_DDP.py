@@ -1,25 +1,23 @@
 import os
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import T5ForConditionalGeneration
-import functools
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.t5.modeling_t5 import T5Block
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from torch.cuda.amp import GradScaler
 
-# Hugging Face 캐시 경로 설정
+import warnings
+warnings.filterwarnings("ignore")
+
 HF_HOME = os.getenv("HF_HOME", "./hf_models")
 os.environ["HF_HOME"] = HF_HOME
 os.makedirs(HF_HOME, exist_ok=True)
 
-# DummyDataset 정의
+
 class DummyDataset(Dataset):
-    def __init__(self, num_samples=64000, num_tokens=256, max_len=256, seed=42):
+    def __init__(self, num_samples=640, num_tokens=256, max_len=256, seed=42):
         super().__init__()
         torch.manual_seed(seed)
         self.num_samples = num_samples
@@ -37,101 +35,106 @@ class DummyDataset(Dataset):
             "labels": self.labels[idx],
         }
 
-# 최대 배치 크기 찾기
-def find_max_batch_size(rank, world_size, start_batch_size=2, max_batch_size=1024):
-    dist.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:33445",
-        rank=rank,
-        world_size=world_size,
-    )
-    torch.cuda.set_device(rank)
 
-    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME).to(rank)
-    model = DDP(model, device_ids=[rank])
-
-    dataset = DummyDataset(num_samples=1000)
-    sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
-
+def find_max_batch_size(local_rank, model, dataset, device, start_batch_size=2, max_batch_size=1024):
     batch_size = start_batch_size
-    success_batch_size = 0
+    success_batch_size = batch_size
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    scaler = GradScaler()
 
-    # 지수적으로 배치 크기 증가
+    pbar = tqdm(total=max_batch_size, desc=f"GPU {local_rank}: Finding Max Batch Size", position=local_rank)
+
     while batch_size <= max_batch_size:
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+        sampler = DistributedSampler(dataset, shuffle=False)
+        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True)
+
         try:
             torch.cuda.empty_cache()
             for data in dataloader:
-                data = {k: data[k].to(rank) for k in data}
-                output = model(**data)
-                torch.mean(output.loss).backward()
-                break  # 한 번의 배치만 테스트
-            print(f"Rank {rank}: Batch size {batch_size} succeeded.")
+                data = {k: v.to(device) for k, v in data.items()}
+                optimizer.zero_grad()
+                with torch.cuda.amp.autocast():
+                    output = model(**data)
+                    loss = torch.mean(output.loss)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                break  # 배치 크기 테스트가 끝나면 다음으로 이동
+
             success_batch_size = batch_size
-            batch_size *= 2  # 배치 크기 두 배로 증가
+            batch_size *= 2  # 2배로 증가
+            pbar.set_postfix(success_batch_size=success_batch_size)
+
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
-                print(f"Rank {rank}: Batch size {batch_size} failed due to OOM.")
+                print(f"GPU {local_rank}: Batch size {batch_size} failed due to OOM.")
+                batch_size //= 2  # OOM 발생 시 절반으로 감소
                 break
             else:
                 raise e
 
-    dist.destroy_process_group()
+    pbar.close()
     return success_batch_size
 
-# 학습 함수
-def train(rank, world_size, batch_size, epochs=5):
-    dist.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:33445",
-        rank=rank,
-        world_size=world_size,
-    )
-    torch.cuda.set_device(rank)
-    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME)
-    wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={T5Block})
-    model = FSDP(model, auto_wrap_policy=wrap_policy, device_id=rank)
 
+def train_ddp(local_rank, world_size, epochs=2):
+    # DDP 초기화
+    dist.init_process_group(backend="nccl", init_method="env://", rank=local_rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    # 데이터 및 모델 준비
     dataset = DummyDataset()
-    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank)
+    dataloader = DataLoader(dataset, sampler=sampler, drop_last=True)
 
+    model = T5ForConditionalGeneration.from_pretrained("t5-large", cache_dir=HF_HOME).to(device)
+    model = DDP(model, device_ids=[local_rank])
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    scaler = GradScaler()
 
-    for epoch in tqdm(range(epochs), desc=f"GPU {rank}: Epoch Progress", position=rank, leave=True):
-        sampler.set_epoch(epoch)
-        batch_bar = tqdm(dataloader, desc=f"GPU {rank}: Batch Progress", position=rank + world_size, leave=False)
-        for data in batch_bar:
-            data = {k: data[k].to(rank) for k in data}
+    # 배치 크기 탐색
+    max_batch_size = find_max_batch_size(local_rank, model, dataset, device)
+    print(f"GPU {local_rank}: Using batch size {max_batch_size}")
+
+    # 학습 루프
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)  # 샘플러 재설정
+        dataloader = DataLoader(dataset, batch_size=max_batch_size, sampler=sampler, drop_last=True)
+
+        batch_bar = tqdm(dataloader, desc=f"GPU {local_rank} Epoch {epoch + 1}/{epochs}", position=local_rank)
+        for i, data in enumerate(batch_bar):
+            data = {k: v.to(device) for k, v in data.items()}
 
             optimizer.zero_grad()
-            output = model(**data)
-            loss = output.loss
-            loss.backward()
-            optimizer.step()
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            start_time.record()  # 타이밍 시작
 
-            # 배치 진행 상황 표시
-            batch_bar.set_postfix(loss=loss.item())
+            with torch.cuda.amp.autocast():
+                output = model(**data)
+                loss = torch.mean(output.loss)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            end_time.record()  # 타이밍 종료
+            torch.cuda.synchronize()  # GPU 연산 동기화
 
-    dist.destroy_process_group()
+            # 처리된 토큰 계산
+            batch_tokens = max_batch_size * data["input_ids"].size(1)
+            elapsed_time = start_time.elapsed_time(end_time) / 1000.0  # 초 단위로 변환
+            tokens_per_second = batch_tokens / elapsed_time if elapsed_time > 0 else 0
 
-# 메인 실행 함수
-def main(rank, world_size, start_batch_size, max_batch_size, epochs):
-    # 최대 배치 크기 탐색
-    if rank == 0:
-        print("Finding maximum batch size...")
-    max_batch_size = find_max_batch_size(rank, world_size, start_batch_size, max_batch_size)
+            # tqdm 업데이트
+            batch_bar.set_postfix(
+                loss=loss.item(),
+                tokens_per_second=f"{tokens_per_second:.2f}",
+            )
 
-    # 학습 시작
-    if rank == 0:
-        print(f"Starting training with batch size {max_batch_size}...")
-    train(rank, world_size, batch_size=max_batch_size, epochs=epochs)
 
 if __name__ == "__main__":
-    num_gpus = torch.cuda.device_count()
-    world_size = num_gpus
-    start_batch_size = 2
-    max_batch_size = 512
-    epochs = 5
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
 
-    mp.spawn(main, nprocs=num_gpus, args=(world_size, start_batch_size, max_batch_size, epochs))
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(train_ddp, args=(world_size,), nprocs=world_size)
